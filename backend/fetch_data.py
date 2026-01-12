@@ -278,7 +278,8 @@ def choose_batch_size(n_symbols: int) -> int:
 
 def fetch_all_yf_data(symbols: List[str]) -> pd.DataFrame:
     """
-    Fetch Yahoo Finance metrics for all symbols in parallel batches.
+    Fetch Yahoo Finance metrics for all symbols in parallel batches,
+    with throttling between batches to avoid 429 errors.
     """
     symbols = [s.upper() for s in symbols]
     n = len(symbols)
@@ -288,24 +289,27 @@ def fetch_all_yf_data(symbols: List[str]) -> pd.DataFrame:
 
     results: List[Dict[str, Any]] = []
 
-    # We'll just use a single ThreadPoolExecutor over all symbols.
-    # The 'batch size' will map to max_workers.
-    max_workers = batch_size
+    # Break into batches
+    for i in range(0, n, batch_size):
+        batch = symbols[i:i + batch_size]
+        print(f"Processing batch {i // batch_size + 1} of {((n - 1) // batch_size) + 1}...")
 
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        future_to_symbol = {
-            executor.submit(fetch_yf_for_symbol, symbol): symbol
-            for symbol in symbols
-        }
+        with ThreadPoolExecutor(max_workers=len(batch)) as executor:
+            future_to_symbol = {
+                executor.submit(fetch_yf_for_symbol, symbol): symbol
+                for symbol in batch
+            }
 
-        for future in as_completed(future_to_symbol):
-            symbol = future_to_symbol[future]
-            try:
-                data = future.result()
-                results.append(data)
-            except Exception as e:
-                # Keep running if one symbol fails
-                print(f"Error fetching data for {symbol}: {e}")
+            for future in as_completed(future_to_symbol):
+                symbol = future_to_symbol[future]
+                try:
+                    data = future.result()
+                    results.append(data)
+                except Exception as e:
+                    print(f"Error fetching data for {symbol}: {e}")
+
+        # Throttle between batches
+        time.sleep(3)
 
     df = pd.DataFrame(results)
     return df
