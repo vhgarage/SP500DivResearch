@@ -14,45 +14,47 @@ FMP_API_KEY = os.environ.get("FMP_API_KEY")
 
 def fetch_sp500_wikipedia() -> pd.DataFrame:
     """
-    Fetch S&P 500 constituents from Wikipedia using a browser-like request.
+    Fetch S&P 500 constituents from Wikipedia using a browser-like request
+    and gracefully handle column name changes.
     """
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                      "AppleWebKit/537.36 (KHTML, like Gecko) "
-                      "Chrome/120.0.0.0 Safari/537.36"
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/120.0.0.0 Safari/537.36"
+        )
     }
 
+    # Fetch HTML with browser-like headers
     resp = requests.get(WIKI_URL, headers=headers, timeout=30)
     resp.raise_for_status()
 
+    # Parse tables from HTML
     tables = pd.read_html(resp.text)
     df = tables[0]
 
-    df = df.rename(
-        columns={
-            "Symbol": "Symbol",
-            "Security": "Company",
-            "GICS Sector": "Sector",
-            "GICS Sub-Industry": "SubIndustry",
-            "Headquarters Location": "Headquarters",
-            "Date first added": "DateFirstAdded",
-            "CIK": "CIK",
-            "Founded": "Founded",
-        }
-    )
+    # Print actual columns for debugging
+    print("Wikipedia columns:", df.columns.tolist())
 
-    df = df[
-        [
-            "Symbol",
-            "Company",
-            "Sector",
-            "SubIndustry",
-            "Headquarters",
-            "DateFirstAdded",
-            "CIK",
-            "Founded",
-        ]
-    ]
+    # Expected columns and their standardized names
+    rename_map = {
+        "Symbol": "Symbol",
+        "Security": "Company",
+        "GICS Sector": "Sector",
+        "GICS Sub-Industry": "SubIndustry",
+        "Headquarters Location": "Headquarters",
+        "Date first added": "DateFirstAdded",
+        "CIK": "CIK",
+        "Founded": "Founded",
+    }
+
+    # Only rename columns that actually exist
+    existing_renames = {k: v for k, v in rename_map.items() if k in df.columns}
+    df = df.rename(columns=existing_renames)
+
+    # Select only the standardized columns that exist
+    selected_cols = list(existing_renames.values())
+    df = df[selected_cols]
 
     return df
 
