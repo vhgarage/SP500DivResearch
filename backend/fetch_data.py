@@ -278,38 +278,36 @@ def choose_batch_size(n_symbols: int) -> int:
 
 def fetch_all_yf_data(symbols: List[str]) -> pd.DataFrame:
     """
-    Fetch Yahoo Finance metrics for all symbols in parallel batches,
-    with throttling between batches to avoid 429 errors.
+    Fetch Yahoo Finance metrics for all symbols sequentially,
+    with retry logic and throttling to avoid 429 errors.
     """
     symbols = [s.upper() for s in symbols]
     n = len(symbols)
-    batch_size = choose_batch_size(n)
-
-    print(f"Fetching Yahoo Finance data for {n} symbols with batch size {batch_size}...")
+    print(f"Fetching Yahoo Finance data for {n} symbols sequentially with retry logic...")
 
     results: List[Dict[str, Any]] = []
 
-    # Break into batches
-    for i in range(0, n, batch_size):
-        batch = symbols[i:i + batch_size]
-        print(f"Processing batch {i // batch_size + 1} of {((n - 1) // batch_size) + 1}...")
+    for idx, symbol in enumerate(symbols):
+        print(f"[{idx+1}/{n}] Fetching {symbol}...")
 
-        with ThreadPoolExecutor(max_workers=len(batch)) as executor:
-            future_to_symbol = {
-                executor.submit(fetch_yf_for_symbol, symbol): symbol
-                for symbol in batch
-            }
+        max_retries = 3
+        delay = 2  # seconds
+        for attempt in range(1, max_retries + 1):
+            try:
+                data = fetch_yf_for_symbol(symbol)
+                results.append(data)
+                break  # success
+            except Exception as e:
+                print(f"Attempt {attempt} failed for {symbol}: {e}")
+                if attempt < max_retries:
+                    sleep_time = delay * attempt
+                    print(f"Retrying in {sleep_time} seconds...")
+                    time.sleep(sleep_time)
+                else:
+                    print(f"Skipping {symbol} after {max_retries} failed attempts.")
 
-            for future in as_completed(future_to_symbol):
-                symbol = future_to_symbol[future]
-                try:
-                    data = future.result()
-                    results.append(data)
-                except Exception as e:
-                    print(f"Error fetching data for {symbol}: {e}")
-
-        # Throttle between batches
-        time.sleep(3)
+        # Throttle between tickers
+        time.sleep(1)
 
     df = pd.DataFrame(results)
     return df
