@@ -14,13 +14,20 @@ FMP_API_KEY = os.environ.get("FMP_API_KEY")
 
 def fetch_sp500_wikipedia() -> pd.DataFrame:
     """
-    Fetch S&P 500 constituents from Wikipedia.
+    Fetch S&P 500 constituents from Wikipedia using a browser-like request.
     """
-    tables = pd.read_html(WIKI_URL)
-    # The first table is the S&P 500 list on the current page structure
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                      "AppleWebKit/537.36 (KHTML, like Gecko) "
+                      "Chrome/120.0.0.0 Safari/537.36"
+    }
+
+    resp = requests.get(WIKI_URL, headers=headers, timeout=30)
+    resp.raise_for_status()
+
+    tables = pd.read_html(resp.text)
     df = tables[0]
 
-    # Standardize column names
     df = df.rename(
         columns={
             "Symbol": "Symbol",
@@ -34,7 +41,6 @@ def fetch_sp500_wikipedia() -> pd.DataFrame:
         }
     )
 
-    # Keep only the columns we care about
     df = df[
         [
             "Symbol",
