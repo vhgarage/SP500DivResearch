@@ -1,17 +1,21 @@
 import os
 import json
 import time
-from typing import List, Dict
+from typing import List, Dict, Any, Optional
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
+import numpy as np
 import pandas as pd
 import requests
+import yfinance as yf
 
 
 WIKI_URL = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
-FMP_BASE = "https://financialmodelingprep.com/api/v3"
-FMP_API_KEY = os.environ.get("FMP_API_KEY")
 
 
+# -----------------------------
+# Wikipedia: S&P 500 constituents
+# -----------------------------
 def fetch_sp500_wikipedia() -> pd.DataFrame:
     """
     Fetch S&P 500 constituents from Wikipedia using a browser-like request
@@ -25,177 +29,291 @@ def fetch_sp500_wikipedia() -> pd.DataFrame:
         )
     }
 
-    # Fetch HTML with browser-like headers
     resp = requests.get(WIKI_URL, headers=headers, timeout=30)
     resp.raise_for_status()
 
-    # Parse tables from HTML
+    # NOTE: FutureWarning from pandas about literal HTML can be ignored for now
     tables = pd.read_html(resp.text)
     df = tables[0]
 
-    # Print actual columns for debugging
+    # Debug: see actual columns
     print("Wikipedia columns:", df.columns.tolist())
 
-    # Expected columns and their standardized names
+    # Map current Wikipedia columns to standardized names.
+    # As of your last run, columns were:
+    # ['Symbol', 'Security', 'GICS Sector', 'GICS Sub-Industry',
+    #  'Headquarters Location', 'Date added', 'CIK', 'Founded']
     rename_map = {
         "Symbol": "Symbol",
         "Security": "Company",
         "GICS Sector": "Sector",
         "GICS Sub-Industry": "SubIndustry",
         "Headquarters Location": "Headquarters",
-        "Date first added": "DateFirstAdded",
+        "Date added": "DateAdded",  # note: not "Date first added" anymore
         "CIK": "CIK",
         "Founded": "Founded",
     }
 
-    # Only rename columns that actually exist
     existing_renames = {k: v for k, v in rename_map.items() if k in df.columns}
     df = df.rename(columns=existing_renames)
 
-    # Select only the standardized columns that exist
     selected_cols = list(existing_renames.values())
     df = df[selected_cols]
 
     return df
 
 
-def chunk_list(lst: List[str], size: int) -> List[List[str]]:
-    return [lst[i : i + size] for i in range(0, len(lst), size)]
-
-
-def fetch_fmp_endpoint(endpoint: str, symbols: List[str]) -> List[Dict]:
+# -----------------------------
+# Helpers for TTM & recent values
+# -----------------------------
+def _sum_last_n_columns(df: pd.DataFrame, label: str, n: int = 4) -> Optional[float]:
     """
-    Fetch data from an FMP endpoint for a list of symbols, in batches.
+    Sum the last n columns (most recent periods) for a given row label in a
+    wide-format DataFrame (columns = dates, index = line items).
+    Returns None if label or data not available.
     """
-    if not FMP_API_KEY:
-        raise RuntimeError("FMP_API_KEY environment variable is not set.")
+    if df is None or df.empty:
+        return None
+    if label not in df.index:
+        return None
 
-    results: List[Dict] = []
-
-    # FMP supports comma-separated tickers, but we keep batch size modest
-    for batch in chunk_list(symbols, 50):
-        tickers_str = ",".join(batch)
-        url = f"{FMP_BASE}/{endpoint}/{tickers_str}"
-        params = {"apikey": FMP_API_KEY}
-
-        resp = requests.get(url, params=params, timeout=30)
-        resp.raise_for_status()
-        data = resp.json()
-
-        # Some endpoints return dict, some list
-        if isinstance(data, dict):
-            # Normalize into list
-            data = [data]
-
-        results.extend(data)
-
-        # Be gentle on the API
-        time.sleep(1)
-
-    return results
+    # Columns are typically dates from oldest to newest or vice versa; we want most recent n
+    cols = df.columns[-n:]
+    values = df.loc[label, cols].dropna()
+    if values.empty:
+        return None
+    return float(values.sum())
 
 
-def to_symbol_keyed(df: pd.DataFrame, key_col: str = "symbol") -> Dict[str, Dict]:
+def _last_annual_value(df: pd.DataFrame, label: str) -> Optional[float]:
     """
-    Convert a DataFrame with a 'symbol'-like column into dict keyed by uppercased symbol.
+    Get the most recent annual value for a label from a wide-format DataFrame.
     """
-    out: Dict[str, Dict] = {}
-    for _, row in df.iterrows():
-        symbol = str(row[key_col]).upper()
-        out[symbol] = row.to_dict()
-    return out
+    if df is None or df.empty:
+        return None
+    if label not in df.index:
+        return None
+    # Most recent column
+    col = df.columns[-1]
+    val = df.loc[label, col]
+    if pd.isna(val):
+        return None
+    return float(val)
 
 
-def fetch_fmp_data(symbols: List[str]) -> pd.DataFrame:
+def _safe_div(numerator: Optional[float], denominator: Optional[float]) -> Optional[float]:
+    if numerator is None or denominator is None or denominator == 0:
+        return None
+    return numerator / denominator
+
+
+# -----------------------------
+# Yahoo Finance per-symbol fetch
+# -----------------------------
+def fetch_yf_for_symbol(symbol: str) -> Dict[str, Any]:
     """
-    Fetch and combine financial data from FMP for the given symbols.
-    We use:
-      - /profile/ for basic info (exchange, country, industry, sector)
-      - /key-metrics-ttm/ for valuation/leverage metrics
-      - /ratios-ttm/ for coverage etc.
+    Fetch extended metrics for a single symbol using Yahoo Finance
+    with a hybrid approach:
+      - TTM (sum of last 4 quarters) for income/cash-flow metrics
+      - Latest annual for balance-sheet metrics
+    """
+    print(f"Fetching Yahoo Finance data for {symbol}...")
+    ticker = yf.Ticker(symbol)
+
+    # Basic info
+    info = ticker.info or {}
+
+    price = info.get("currentPrice") or info.get("regularMarketPrice")
+    market_cap = info.get("marketCap")
+    beta = info.get("beta")
+    trailing_pe = info.get("trailingPE")
+
+    # Dividends (TTM)
+    dividends = ticker.dividends
+    dividend_ttm = None
+    dividend_yield = None
+    payout_ratio = None
+
+    if dividends is not None and not dividends.empty:
+        # Sum last 12 months of dividends
+        last_year = dividends[dividends.index >= (dividends.index.max() - pd.DateOffset(years=1))]
+        if not last_year.empty:
+            dividend_ttm = float(last_year.sum())
+            if price not in (None, 0):
+                dividend_yield = dividend_ttm / price
+        # Payout ratio will use EPS_TTM later if available
+
+    # Financial statements
+    q_income = ticker.quarterly_financials
+    a_income = ticker.financials
+    q_cf = ticker.quarterly_cashflow
+    a_cf = ticker.cashflow
+    a_bs = ticker.balance_sheet
+
+    # TTM metrics from quarterly income statement
+    revenue_ttm = _sum_last_n_columns(q_income, "Total Revenue")
+    ebit_ttm = _sum_last_n_columns(q_income, "Ebit")
+    operating_income_ttm = _sum_last_n_columns(q_income, "Operating Income")
+    net_income_ttm = _sum_last_n_columns(q_income, "Net Income")
+
+    # EPS TTM approximated from net income TTM and shares
+    shares_out = info.get("sharesOutstanding")
+    eps_ttm = None
+    if net_income_ttm is not None and shares_out not in (None, 0):
+        eps_ttm = net_income_ttm / shares_out
+
+    # EBITDA TTM: use EBITDA from quarterly income if available
+    ebitda_ttm = _sum_last_n_columns(q_income, "Ebitda")
+
+    # Free cash flow TTM from quarterly cash flow statement
+    # Free cash flow often approximated as Operating Cash Flow - Capital Expenditure
+    ocf_ttm = _sum_last_n_columns(q_cf, "Total Cash From Operating Activities")
+    capex_ttm = _sum_last_n_columns(q_cf, "Capital Expenditures")
+    fcf_ttm = None
+    if ocf_ttm is not None and capex_ttm is not None:
+        fcf_ttm = ocf_ttm - capex_ttm
+
+    # Annual balance sheet metrics
+    total_debt = None
+    cash = None
+    total_equity = None
+    total_assets = None
+
+    if a_bs is not None and not a_bs.empty:
+        total_debt = _last_annual_value(a_bs, "Total Debt")
+        if total_debt is None:
+            # Sometimes "Short Long Term Debt" + "Long Term Debt"
+            short_debt = _last_annual_value(a_bs, "Short Long Term Debt") or 0.0
+            long_debt = _last_annual_value(a_bs, "Long Term Debt") or 0.0
+            total_debt = short_debt + long_debt if (short_debt or long_debt) else None
+
+        cash = _last_annual_value(a_bs, "Cash And Cash Equivalents")
+        if cash is None:
+            cash = _last_annual_value(a_bs, "Cash")
+
+        total_equity = _last_annual_value(a_bs, "Total Stockholder Equity")
+        total_assets = _last_annual_value(a_bs, "Total Assets")
+
+    # Annual income/interest (for interest coverage)
+    # Auto-fallback: prefer TTM from quarterly, else use annual
+    interest_expense_ttm = _sum_last_n_columns(q_income, "Interest Expense")
+    interest_expense_annual = _last_annual_value(a_income, "Interest Expense")
+    interest_expense = interest_expense_ttm if interest_expense_ttm is not None else interest_expense_annual
+
+    # Annual cash flow: sometimes FCF or interest available here as well; optional
+    # (We already computed FCF from quarterly.)
+
+    # Hybrid / derived metrics
+    pe_ttm = None
+    if price not in (None, 0) and eps_ttm not in (None, 0):
+        pe_ttm = price / eps_ttm
+
+    if dividend_ttm is not None and eps_ttm not in (None, 0):
+        payout_ratio = dividend_ttm / eps_ttm
+
+    net_debt = None
+    if total_debt is not None:
+        net_debt = total_debt - (cash or 0.0)
+
+    net_debt_to_ebitda = _safe_div(net_debt, ebitda_ttm)
+    debt_to_equity = _safe_div(total_debt, total_equity)
+    interest_coverage = _safe_div(ebit_ttm, interest_expense)
+
+    # Margins & returns
+    operating_margin = _safe_div(operating_income_ttm, revenue_ttm)
+    profit_margin = _safe_div(net_income_ttm, revenue_ttm)
+    roe = _safe_div(net_income_ttm, total_equity)
+    roa = _safe_div(net_income_ttm, total_assets)
+
+    # Build result dictionary
+    result: Dict[str, Any] = {
+        "Symbol": symbol,
+        "Price": price,
+        "MarketCap": market_cap,
+        "Beta": beta,
+        "PE_TTM": pe_ttm,
+        "EPS_TTM": eps_ttm,
+        "Dividend_TTM": dividend_ttm,
+        "DividendYield_TTM": dividend_yield,
+        "PayoutRatio_TTM": payout_ratio,
+        "Revenue_TTM": revenue_ttm,
+        "EBIT_TTM": ebit_ttm,
+        "EBITDA_TTM": ebitda_ttm,
+        "NetIncome_TTM": net_income_ttm,
+        "FreeCashFlow_TTM": fcf_ttm,
+        "OperatingMargin_TTM": operating_margin,
+        "ProfitMargin_TTM": profit_margin,
+        "ROE_TTM": roe,
+        "ROA_TTM": roa,
+        "TotalDebt_Annual": total_debt,
+        "Cash_Annual": cash,
+        "TotalEquity_Annual": total_equity,
+        "TotalAssets_Annual": total_assets,
+        "NetDebt": net_debt,
+        "NetDebtToEBITDA_TTM": net_debt_to_ebitda,
+        "DebtToEquity_Annual": debt_to_equity,
+        "InterestExpense_Hybrid": interest_expense,
+        "InterestCoverage_TTM": interest_coverage,
+    }
+
+    return result
+
+
+# -----------------------------
+# Parallel fetching orchestration
+# -----------------------------
+def choose_batch_size(n_symbols: int) -> int:
+    """
+    Simple 'auto-tuning' of batch size based on number of symbols.
+    This avoids overloading the runner while still being fast.
+    """
+    if n_symbols > 400:
+        return 25
+    if n_symbols > 250:
+        return 20
+    if n_symbols > 100:
+        return 15
+    return 10
+
+
+def fetch_all_yf_data(symbols: List[str]) -> pd.DataFrame:
+    """
+    Fetch Yahoo Finance metrics for all symbols in parallel batches.
     """
     symbols = [s.upper() for s in symbols]
+    n = len(symbols)
+    batch_size = choose_batch_size(n)
 
-    # Profile
-    profile_raw = fetch_fmp_endpoint("profile", symbols)
-    profile_df = pd.DataFrame(profile_raw)
-    if not profile_df.empty:
-        profile_df = profile_df.rename(
-            columns={
-                "symbol": "Symbol",
-                "companyName": "FMP_CompanyName",
-                "exchangeShortName": "Exchange",
-                "industry": "FMP_Industry",
-                "sector": "FMP_Sector",
-                "price": "Price",
-                "mktCap": "MarketCap",
-                "beta": "Beta",
-            }
-        )
-        profile_df = profile_df[
-            [
-                "Symbol",
-                "FMP_CompanyName",
-                "Exchange",
-                "FMP_Industry",
-                "FMP_Sector",
-                "Price",
-                "MarketCap",
-                "Beta",
-            ]
-        ]
+    print(f"Fetching Yahoo Finance data for {n} symbols with batch size {batch_size}...")
 
-    # Key metrics TTM
-    km_raw = fetch_fmp_endpoint("key-metrics-ttm", symbols)
-    km_df = pd.DataFrame(km_raw)
-    if not km_df.empty:
-        km_df = km_df.rename(
-            columns={
-                "symbol": "Symbol",
-                "peTTM": "PE_TTM",
-                "dividendYieldTTM": "DividendYield_TTM",
-                "dividendPerShareTTM": "DividendRate_TTM",
-                "payoutRatioTTM": "PayoutRatio_TTM",
-                "netDebtToEBITDATTM": "NetDebtToEBITDA_TTM",
-                "debtToEquityTTM": "DebtToEquity_TTM",
-            }
-        )
-        km_df = km_df[
-            [
-                "Symbol",
-                "PE_TTM",
-                "DividendYield_TTM",
-                "DividendRate_TTM",
-                "PayoutRatio_TTM",
-                "NetDebtToEBITDA_TTM",
-                "DebtToEquity_TTM",
-            ]
-        ]
+    results: List[Dict[str, Any]] = []
 
-    # Ratios TTM (for interest coverage etc., where available)
-    ratios_raw = fetch_fmp_endpoint("ratios-ttm", symbols)
-    ratios_df = pd.DataFrame(ratios_raw)
-    if not ratios_df.empty:
-        ratios_df = ratios_df.rename(
-            columns={
-                "symbol": "Symbol",
-                "interestCoverageTTM": "InterestCoverage_TTM",
-            }
-        )
-        ratios_df = ratios_df[["Symbol", "InterestCoverage_TTM"]]
+    # We'll just use a single ThreadPoolExecutor over all symbols.
+    # The 'batch size' will map to max_workers.
+    max_workers = batch_size
 
-    # Merge all FMP pieces
-    df = profile_df
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        future_to_symbol = {
+            executor.submit(fetch_yf_for_symbol, symbol): symbol
+            for symbol in symbols
+        }
 
-    if not km_df.empty:
-        df = df.merge(km_df, on="Symbol", how="left")
+        for future in as_completed(future_to_symbol):
+            symbol = future_to_symbol[future]
+            try:
+                data = future.result()
+                results.append(data)
+            except Exception as e:
+                # Keep running if one symbol fails
+                print(f"Error fetching data for {symbol}: {e}")
 
-    if not ratios_df.empty:
-        df = df.merge(ratios_df, on="Symbol", how="left")
-
+    df = pd.DataFrame(results)
     return df
 
 
+# -----------------------------
+# Main orchestration
+# -----------------------------
 def main():
     # Paths relative to repo root
     data_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), "data")
@@ -205,27 +323,27 @@ def main():
     print("Fetching S&P 500 metadata from Wikipedia...")
     sp_df = fetch_sp500_wikipedia()
 
-    # 2) Fetch FMP data
+    # 2) Fetch Yahoo Finance data
     symbols = sp_df["Symbol"].dropna().astype(str).tolist()
-    print(f"Fetching FMP financial data for {len(symbols)} symbols...")
-    fmp_df = fetch_fmp_data(symbols)
+    print(f"Fetching Yahoo Finance financial data for {len(symbols)} symbols...")
+    yf_df = fetch_all_yf_data(symbols)
 
     # 3) Merge
     print("Merging datasets...")
-    combined = sp_df.merge(fmp_df, on="Symbol", how="left")
+    combined = sp_df.merge(yf_df, on="Symbol", how="left")
 
     # 4) Save to JSON
     sp_path = os.path.join(data_dir, "sp500_metadata.json")
-    fmp_path = os.path.join(data_dir, "fmp_financials.json")
+    yf_path = os.path.join(data_dir, "yf_financials.json")
     combined_path = os.path.join(data_dir, "combined.json")
 
     sp_df.to_json(sp_path, orient="records")
-    fmp_df.to_json(fmp_path, orient="records")
+    yf_df.to_json(yf_path, orient="records")
     combined.to_json(combined_path, orient="records")
 
     print("Saved:")
     print(f"  {sp_path}")
-    print(f"  {fmp_path}")
+    print(f"  {yf_path}")
     print(f"  {combined_path}")
 
 
