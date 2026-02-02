@@ -283,7 +283,7 @@ def fetch_all_yf_data(symbols: List[str]) -> pd.DataFrame:
     """
     symbols = [s.upper() for s in symbols]
     n = len(symbols)
-    print(f"Fetching Yahoo Finance data for {n} symbols sequentially with retry logic...")
+    print(f"Fetching Yahoo Finance data for {n} symbols sequentially with heavy throttling...")
 
     results: List[Dict[str, Any]] = []
 
@@ -291,7 +291,10 @@ def fetch_all_yf_data(symbols: List[str]) -> pd.DataFrame:
         print(f"[{idx+1}/{n}] Fetching {symbol}...")
 
         max_retries = 3
-        delay = 2  # seconds
+
+        # Increase base delay to reduce Yahoo throttling
+        base_delay = 5   # previously 2 seconds
+
         for attempt in range(1, max_retries + 1):
             try:
                 data = fetch_yf_for_symbol(symbol)
@@ -299,15 +302,17 @@ def fetch_all_yf_data(symbols: List[str]) -> pd.DataFrame:
                 break  # success
             except Exception as e:
                 print(f"Attempt {attempt} failed for {symbol}: {e}")
+
                 if attempt < max_retries:
-                    sleep_time = delay * attempt
+                    # Exponential backoff: 5s, 10s, 15s
+                    sleep_time = base_delay * attempt
                     print(f"Retrying in {sleep_time} seconds...")
                     time.sleep(sleep_time)
                 else:
                     print(f"Skipping {symbol} after {max_retries} failed attempts.")
 
-        # Throttle between tickers
-        time.sleep(1)
+        # Throttle between tickers — increase from 1s → 6s
+        time.sleep(6)
 
     df = pd.DataFrame(results)
     return df
