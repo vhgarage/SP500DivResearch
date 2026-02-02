@@ -273,9 +273,12 @@ def fetch_all_yf_data(symbols: List[str]) -> pd.DataFrame:
     with:
       - automatic resume from partial results
       - caching of previously fetched symbols
-      - light throttling
+      - randomized throttling to avoid Yahoo rate limits
+      - periodic cooldowns
       - robust error handling
     """
+
+    import random
 
     symbols = [s.upper() for s in symbols]
     n = len(symbols)
@@ -306,7 +309,7 @@ def fetch_all_yf_data(symbols: List[str]) -> pd.DataFrame:
 
         # Skip if already cached
         if symbol in cache:
-            print(f"  → Using cached data")
+            print("  → Using cached data")
             results.append(cache[symbol])
             continue
 
@@ -315,7 +318,7 @@ def fetch_all_yf_data(symbols: List[str]) -> pd.DataFrame:
             data = fetch_yf_for_symbol(symbol)
             results.append(data)
 
-            # Update cache immediately (safer for long runs)
+            # Update cache immediately
             cache[symbol] = data
             with open(cache_path, "w") as f:
                 json.dump(list(cache.values()), f, indent=2)
@@ -325,19 +328,28 @@ def fetch_all_yf_data(symbols: List[str]) -> pd.DataFrame:
             error_entry = {"Symbol": symbol, "Error": str(e)}
             results.append(error_entry)
 
-            # Cache the failure too (so we don't retry endlessly)
+            # Cache the failure too
             cache[symbol] = error_entry
             with open(cache_path, "w") as f:
                 json.dump(list(cache.values()), f, indent=2)
 
-        # Light throttle (yfinance is stable, so 0.3s is enough)
-        time.sleep(0.3)
+        # --------------------------------------------------------
+        # Randomized delay between 0.8s and 3.0s
+        # --------------------------------------------------------
+        sleep_time = random.uniform(0.8, 3.0)
+        time.sleep(sleep_time)
+
+        # --------------------------------------------------------
+        # Every 50 tickers, take a long cooldown
+        # --------------------------------------------------------
+        if (idx + 1) % 50 == 0:
+            print("Reached 50‑ticker batch. Cooling down for 60 seconds...")
+            time.sleep(60)
 
     # ------------------------------------------------------------
     # 3. Return DataFrame
     # ------------------------------------------------------------
-    return pd.DataFrame(results)
-    
+    return pd.DataFrame(results)    
     
 # -----------------------------
 # Main orchestration
