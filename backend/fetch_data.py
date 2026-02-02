@@ -269,88 +269,185 @@ def choose_batch_size(n_symbols: int) -> int:
 
 def fetch_all_yf_data(symbols: List[str]) -> pd.DataFrame:
     """
-    Fetch Yahoo Finance metrics for all symbols using yfinance,
-    with:
-      - automatic resume from partial results
-      - caching of previously fetched symbols
-      - randomized throttling to avoid Yahoo rate limits
-      - periodic cooldowns
-      - robust error handling
+    Two-phase adaptive Yahoo Finance fetcher using yfinance.
+
+    Phase 1:
+      - Free run (no batch limit), fetch symbol by symbol.
+      - On first 429 ever: switch to batch mode, sleep, restart.
+
+    Phase 2 (batch mode):
+      - Start with batch size = 75.
+      - On 429: sleep, reduce batch size by 5 (min 5), restart.
+      - Continue until all symbols are fetched.
+
+    Includes:
+      - caching
+      - randomized pacing
+      - cooldowns
+      - end-of-run summary
     """
 
     import random
+    import subprocess
+    import sys
 
-    symbols = [s.upper() for s in symbols]
-    n = len(symbols)
-    print(f"Fetching Yahoo Finance data for {n} symbols using yfinance...")
-
-    # ------------------------------------------------------------
-    # 1. Load existing cache (if any)
-    # ------------------------------------------------------------
+    mode_path = "data/yf_mode.txt"          # "free" or "batch"
+    batch_size_path = "data/yf_batch_size.txt"
     cache_path = "data/yf_financials.json"
-    cache = {}
 
+    # -----------------------------
+    # Determine mode
+    # -----------------------------
+    if os.path.exists(mode_path):
+        with open(mode_path, "r") as f:
+            mode = f.read().strip()
+    else:
+        mode = "free"
+        os.makedirs("data", exist_ok=True)
+        with open(mode_path, "w") as f:
+            f.write(mode)
+
+    # -----------------------------
+    # Load cache
+    # -----------------------------
+    cache = {}
     if os.path.exists(cache_path):
         try:
             with open(cache_path, "r") as f:
                 cached_list = json.load(f)
                 cache = {item["Symbol"]: item for item in cached_list}
-            print(f"Loaded {len(cache)} cached symbols. Will resume from there.")
+            print(f"Loaded {len(cache)} cached symbols. Will resume.")
         except Exception as e:
             print(f"Warning: Could not load cache: {e}")
 
-    results = []
+    symbols = [s.upper() for s in symbols]
+    n = len(symbols)
+    remaining = [s for s in symbols if s not in cache]
+    print(f"Mode: {mode.upper()}")
+    print(f"Total symbols: {n}, remaining: {len(remaining)}")
 
-    # ------------------------------------------------------------
-    # 2. Iterate through symbols with resume logic
-    # ------------------------------------------------------------
-    for idx, symbol in enumerate(symbols):
-        print(f"[{idx+1}/{n}] {symbol}")
+    # Helper to persist cache
+    def save_cache():
+        with open(cache_path, "w") as f:
+            json.dump(list(cache.values()), f, indent=2)
 
-        # Skip if already cached
-        if symbol in cache:
-            print("  → Using cached data")
-            results.append(cache[symbol])
-            continue
+    # Helper to handle 429
+    def handle_429(current_batch_size: Optional[int] = None):
+        nonlocal mode
+        print("  → 429 detected. Entering cooldown...")
+        time.sleep(600)  # 10 minutes
 
-        # Fetch fresh data
-        try:
-            data = fetch_yf_for_symbol(symbol)
-            results.append(data)
+        # Switch to batch mode if we were in free mode
+        if mode == "free":
+            mode = "batch"
+            with open(mode_path, "w") as f:
+                f.write(mode)
+            batch_size = 75
+            with open(batch_size_path, "w") as f:
+                f.write(str(batch_size))
+            print("  → Switching to BATCH mode with batch size 75.")
+        else:
+            # Already in batch mode: reduce batch size
+            if current_batch_size is None:
+                current_batch_size = 75
+            new_batch_size = max(5, current_batch_size - 5)
+            with open(batch_size_path, "w") as f:
+                f.write(str(new_batch_size))
+            print(f"  → Reducing batch size from {current_batch_size} to {new_batch_size}.")
 
-            # Update cache immediately
-            cache[symbol] = data
-            with open(cache_path, "w") as f:
-                json.dump(list(cache.values()), f, indent=2)
+        print("  → Restarting fetcher...")
+        subprocess.Popen([sys.executable, sys.argv[0]])
+        sys.exit(0)
 
-        except Exception as e:
-            print(f"  → Failed to fetch {symbol}: {e}")
-            error_entry = {"Symbol": symbol, "Error": str(e)}
-            results.append(error_entry)
+    # -----------------------------
+    # PHASE 1: FREE RUN
+    # -----------------------------
+    if mode == "free":
+        print("Starting FREE RUN (no batch limit)...")
+        for idx, symbol in enumerate(remaining):
+            print(f"[{idx+1}/{len(remaining)}] {symbol}")
+            try:
+                data = fetch_yf_for_symbol(symbol)
+                cache[symbol] = data
+                save_cache()
+            except Exception as e:
+                msg = str(e)
+                if "429" in msg or "Too Many Requests" in msg:
+                    handle_429()
+                print(f"  → Failed to fetch {symbol}: {msg}")
+                cache[symbol] = {"Symbol": symbol, "Error": msg}
+                save_cache()
 
-            # Cache the failure too
-            cache[symbol] = error_entry
-            with open(cache_path, "w") as f:
-                json.dump(list(cache.values()), f, indent=2)
+            time.sleep(random.uniform(0.8, 3.0))
 
-        # --------------------------------------------------------
-        # Randomized delay between 0.8s and 3.0s
-        # --------------------------------------------------------
-        sleep_time = random.uniform(0.8, 3.0)
-        time.sleep(sleep_time)
+        # -----------------------------
+        # SUMMARY
+        # -----------------------------
+        successes = sum(1 for v in cache.values() if "Error" not in v)
+        failures = sum(1 for v in cache.values() if "Error" in v)
+        print("\n===== SUMMARY =====")
+        print(f"Mode: FREE RUN")
+        print(f"Total symbols: {n}")
+        print(f"Fetched successfully: {successes}")
+        print(f"Failed: {failures}")
+        print(f"Remaining: {n - len(cache)}")
+        print("===================\n")
 
-        # --------------------------------------------------------
-        # Every 50 tickers, take a long cooldown
-        # --------------------------------------------------------
-        if (idx + 1) % 50 == 0:
-            print("Reached 50‑ticker batch. Cooling down for 60 seconds...")
-            time.sleep(60)
+        return pd.DataFrame(list(cache.values()))
 
-    # ------------------------------------------------------------
-    # 3. Return DataFrame
-    # ------------------------------------------------------------
-    return pd.DataFrame(results)    
-    
+    # -----------------------------
+    # PHASE 2: BATCH MODE
+    # -----------------------------
+    if os.path.exists(batch_size_path):
+        with open(batch_size_path, "r") as f:
+            batch_size = int(f.read().strip())
+    else:
+        batch_size = 75
+        with open(batch_size_path, "w") as f:
+            f.write(str(batch_size))
+
+    print(f"Starting BATCH MODE with batch size {batch_size}...")
+    remaining = [s for s in symbols if s not in cache]
+    print(f"{len(remaining)} symbols remaining in batch mode.")
+
+    for batch_start in range(0, len(remaining), batch_size):
+        batch = remaining[batch_start : batch_start + batch_size]
+        print(f"\nProcessing batch of {len(batch)} symbols (batch size {batch_size})...")
+
+        for symbol in batch:
+            print(f"  Fetching {symbol}...")
+            try:
+                data = fetch_yf_for_symbol(symbol)
+                cache[symbol] = data
+                save_cache()
+            except Exception as e:
+                msg = str(e)
+                if "429" in msg or "Too Many Requests" in msg:
+                    handle_429(current_batch_size=batch_size)
+                print(f"  → Failed to fetch {symbol}: {msg}")
+                cache[symbol] = {"Symbol": symbol, "Error": msg}
+                save_cache()
+
+            time.sleep(random.uniform(0.8, 3.0))
+
+        print("Batch complete. Cooling down for 3 minutes...")
+        time.sleep(180)
+
+    # -----------------------------
+    # SUMMARY
+    # -----------------------------
+    successes = sum(1 for v in cache.values() if "Error" not in v)
+    failures = sum(1 for v in cache.values() if "Error" in v)
+    print("\n===== SUMMARY =====")
+    print(f"Mode: BATCH MODE")
+    print(f"Batch size used: {batch_size}")
+    print(f"Total symbols: {n}")
+    print(f"Fetched successfully: {successes}")
+    print(f"Failed: {failures}")
+    print(f"Remaining: {n - len(cache)}")
+    print("===================\n")
+
+    return pd.DataFrame(list(cache.values()))    
 # -----------------------------
 # Main orchestration
 # -----------------------------
