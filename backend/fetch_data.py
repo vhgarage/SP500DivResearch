@@ -273,17 +273,18 @@ def fetch_all_yf_data(symbols: List[str]) -> pd.DataFrame:
 
     Phase 1:
       - Free run (no batch limit), fetch symbol by symbol.
-      - On first 429 ever: switch to batch mode, sleep, restart.
+      - On first 429 (explicit or silent): switch to batch mode, sleep, restart.
 
     Phase 2 (batch mode):
       - Start with batch size = 75.
-      - On 429: sleep, reduce batch size by 5 (min 5), restart.
+      - On 429 (explicit or silent): sleep, reduce batch size by 5 (min 5), restart.
       - Continue until all symbols are fetched.
 
     Includes:
       - caching
       - randomized pacing
       - cooldowns
+      - strict silent-429 detection
       - end-of-run summary
     """
 
@@ -331,10 +332,19 @@ def fetch_all_yf_data(symbols: List[str]) -> pd.DataFrame:
         with open(cache_path, "w") as f:
             json.dump(list(cache.values()), f, indent=2)
 
+    # Strict silent-429 detector (Option A)
+    def is_silent_429(data: Dict[str, Any]) -> bool:
+        return (
+            data.get("Revenue_TTM") is None and
+            data.get("EBIT_TTM") is None and
+            data.get("NetIncome_TTM") is None and
+            data.get("TotalAssets_Annual") is None
+        )
+
     # Helper to handle 429
     def handle_429(current_batch_size: Optional[int] = None):
         nonlocal mode
-        print("  → 429 detected. Entering cooldown...")
+        print("  → 429 detected (explicit or silent). Entering cooldown...")
         time.sleep(600)  # 10 minutes
 
         # Switch to batch mode if we were in free mode
@@ -368,8 +378,15 @@ def fetch_all_yf_data(symbols: List[str]) -> pd.DataFrame:
             print(f"[{idx+1}/{len(remaining)}] {symbol}")
             try:
                 data = fetch_yf_for_symbol(symbol)
+
+                # Silent 429 detection
+                if is_silent_429(data):
+                    print("  → Silent throttling detected.")
+                    handle_429()
+
                 cache[symbol] = data
                 save_cache()
+
             except Exception as e:
                 msg = str(e)
                 if "429" in msg or "Too Many Requests" in msg:
@@ -418,8 +435,15 @@ def fetch_all_yf_data(symbols: List[str]) -> pd.DataFrame:
             print(f"  Fetching {symbol}...")
             try:
                 data = fetch_yf_for_symbol(symbol)
+
+                # Silent 429 detection
+                if is_silent_429(data):
+                    print("  → Silent throttling detected.")
+                    handle_429(current_batch_size=batch_size)
+
                 cache[symbol] = data
                 save_cache()
+
             except Exception as e:
                 msg = str(e)
                 if "429" in msg or "Too Many Requests" in msg:
@@ -447,7 +471,9 @@ def fetch_all_yf_data(symbols: List[str]) -> pd.DataFrame:
     print(f"Remaining: {n - len(cache)}")
     print("===================\n")
 
-    return pd.DataFrame(list(cache.values()))    
+    return pd.DataFrame(list(cache.values()))
+    
+
 # -----------------------------
 # Main orchestration
 # -----------------------------
