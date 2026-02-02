@@ -112,7 +112,7 @@ def _safe_div(numerator: Optional[float], denominator: Optional[float]) -> Optio
 # -----------------------------
 def fetch_yf_for_symbol(symbol: str) -> Dict[str, Any]:
     """
-    Fetch extended metrics for a single symbol using Yahoo Finance
+    Fetch extended metrics for a single symbol using yfinance
     with a hybrid approach:
       - TTM (sum of last 4 quarters) for income/cash-flow metrics
       - Latest annual for balance-sheet metrics
@@ -135,15 +135,13 @@ def fetch_yf_for_symbol(symbol: str) -> Dict[str, Any]:
     payout_ratio = None
 
     if dividends is not None and not dividends.empty:
-        # Sum last 12 months of dividends
         last_year = dividends[dividends.index >= (dividends.index.max() - pd.DateOffset(years=1))]
         if not last_year.empty:
             dividend_ttm = float(last_year.sum())
             if price not in (None, 0):
                 dividend_yield = dividend_ttm / price
-        # Payout ratio will use EPS_TTM later if available
 
-    # Financial statements
+    # Financial statements (yfinance DataFrames)
     q_income = ticker.quarterly_financials
     a_income = ticker.financials
     q_cf = ticker.quarterly_cashflow
@@ -156,17 +154,16 @@ def fetch_yf_for_symbol(symbol: str) -> Dict[str, Any]:
     operating_income_ttm = _sum_last_n_columns(q_income, "Operating Income")
     net_income_ttm = _sum_last_n_columns(q_income, "Net Income")
 
-    # EPS TTM approximated from net income TTM and shares
+    # EPS TTM
     shares_out = info.get("sharesOutstanding")
     eps_ttm = None
     if net_income_ttm is not None and shares_out not in (None, 0):
         eps_ttm = net_income_ttm / shares_out
 
-    # EBITDA TTM: use EBITDA from quarterly income if available
+    # EBITDA TTM
     ebitda_ttm = _sum_last_n_columns(q_income, "Ebitda")
 
-    # Free cash flow TTM from quarterly cash flow statement
-    # Free cash flow often approximated as Operating Cash Flow - Capital Expenditure
+    # Free cash flow TTM
     ocf_ttm = _sum_last_n_columns(q_cf, "Total Cash From Operating Activities")
     capex_ttm = _sum_last_n_columns(q_cf, "Capital Expenditures")
     fcf_ttm = None
@@ -182,7 +179,6 @@ def fetch_yf_for_symbol(symbol: str) -> Dict[str, Any]:
     if a_bs is not None and not a_bs.empty:
         total_debt = _last_annual_value(a_bs, "Total Debt")
         if total_debt is None:
-            # Sometimes "Short Long Term Debt" + "Long Term Debt"
             short_debt = _last_annual_value(a_bs, "Short Long Term Debt") or 0.0
             long_debt = _last_annual_value(a_bs, "Long Term Debt") or 0.0
             total_debt = short_debt + long_debt if (short_debt or long_debt) else None
@@ -194,14 +190,10 @@ def fetch_yf_for_symbol(symbol: str) -> Dict[str, Any]:
         total_equity = _last_annual_value(a_bs, "Total Stockholder Equity")
         total_assets = _last_annual_value(a_bs, "Total Assets")
 
-    # Annual income/interest (for interest coverage)
-    # Auto-fallback: prefer TTM from quarterly, else use annual
+    # Interest expense (hybrid)
     interest_expense_ttm = _sum_last_n_columns(q_income, "Interest Expense")
     interest_expense_annual = _last_annual_value(a_income, "Interest Expense")
     interest_expense = interest_expense_ttm if interest_expense_ttm is not None else interest_expense_annual
-
-    # Annual cash flow: sometimes FCF or interest available here as well; optional
-    # (We already computed FCF from quarterly.)
 
     # Hybrid / derived metrics
     pe_ttm = None
@@ -257,8 +249,7 @@ def fetch_yf_for_symbol(symbol: str) -> Dict[str, Any]:
     }
 
     return result
-
-
+    
 # -----------------------------
 # Parallel fetching orchestration
 # -----------------------------
@@ -278,46 +269,76 @@ def choose_batch_size(n_symbols: int) -> int:
 
 def fetch_all_yf_data(symbols: List[str]) -> pd.DataFrame:
     """
-    Fetch Yahoo Finance metrics for all symbols sequentially,
-    with retry logic and throttling to avoid 429 errors.
+    Fetch Yahoo Finance metrics for all symbols using yfinance,
+    with:
+      - automatic resume from partial results
+      - caching of previously fetched symbols
+      - light throttling
+      - robust error handling
     """
+
     symbols = [s.upper() for s in symbols]
     n = len(symbols)
-    print(f"Fetching Yahoo Finance data for {n} symbols sequentially with heavy throttling...")
+    print(f"Fetching Yahoo Finance data for {n} symbols using yfinance...")
 
-    results: List[Dict[str, Any]] = []
+    # ------------------------------------------------------------
+    # 1. Load existing cache (if any)
+    # ------------------------------------------------------------
+    cache_path = "data/yf_financials.json"
+    cache = {}
 
+    if os.path.exists(cache_path):
+        try:
+            with open(cache_path, "r") as f:
+                cached_list = json.load(f)
+                cache = {item["Symbol"]: item for item in cached_list}
+            print(f"Loaded {len(cache)} cached symbols. Will resume from there.")
+        except Exception as e:
+            print(f"Warning: Could not load cache: {e}")
+
+    results = []
+
+    # ------------------------------------------------------------
+    # 2. Iterate through symbols with resume logic
+    # ------------------------------------------------------------
     for idx, symbol in enumerate(symbols):
-        print(f"[{idx+1}/{n}] Fetching {symbol}...")
+        print(f"[{idx+1}/{n}] {symbol}")
 
-        max_retries = 3
+        # Skip if already cached
+        if symbol in cache:
+            print(f"  → Using cached data")
+            results.append(cache[symbol])
+            continue
 
-        # Increase base delay to reduce Yahoo throttling
-        base_delay = 5   # previously 2 seconds
+        # Fetch fresh data
+        try:
+            data = fetch_yf_for_symbol(symbol)
+            results.append(data)
 
-        for attempt in range(1, max_retries + 1):
-            try:
-                data = fetch_yf_for_symbol(symbol)
-                results.append(data)
-                break  # success
-            except Exception as e:
-                print(f"Attempt {attempt} failed for {symbol}: {e}")
+            # Update cache immediately (safer for long runs)
+            cache[symbol] = data
+            with open(cache_path, "w") as f:
+                json.dump(list(cache.values()), f, indent=2)
 
-                if attempt < max_retries:
-                    # Exponential backoff: 5s, 10s, 15s
-                    sleep_time = base_delay * attempt
-                    print(f"Retrying in {sleep_time} seconds...")
-                    time.sleep(sleep_time)
-                else:
-                    print(f"Skipping {symbol} after {max_retries} failed attempts.")
+        except Exception as e:
+            print(f"  → Failed to fetch {symbol}: {e}")
+            error_entry = {"Symbol": symbol, "Error": str(e)}
+            results.append(error_entry)
 
-        # Throttle between tickers — increase from 1s → 6s
-        time.sleep(6)
+            # Cache the failure too (so we don't retry endlessly)
+            cache[symbol] = error_entry
+            with open(cache_path, "w") as f:
+                json.dump(list(cache.values()), f, indent=2)
 
-    df = pd.DataFrame(results)
-    return df
+        # Light throttle (yfinance is stable, so 0.3s is enough)
+        time.sleep(0.3)
 
-
+    # ------------------------------------------------------------
+    # 3. Return DataFrame
+    # ------------------------------------------------------------
+    return pd.DataFrame(results)
+    
+    
 # -----------------------------
 # Main orchestration
 # -----------------------------
