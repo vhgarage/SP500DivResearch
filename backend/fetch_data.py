@@ -534,7 +534,7 @@ def fetch_all_yf_data(symbols: List[str]) -> pd.DataFrame:
     print(f"Mode: BATCH MODE")
     print(f"Batch size used: {batch_size}")
     print(f"Total symbols: {n}")
-        print(f"Fetched successfully: {successes}")
+    print(f"Fetched successfully: {successes}")
     print(f"Failed: {failures}")
     print(f"Remaining: {n - len(cache)}")
     print("===================\n")
