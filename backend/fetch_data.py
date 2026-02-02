@@ -284,7 +284,7 @@ def fetch_all_yf_data(symbols: List[str]) -> pd.DataFrame:
       - caching
       - randomized pacing
       - cooldowns
-      - strict silent-429 detection
+      - strict + soft silent-429 detection
       - end-of-run summary
     """
 
@@ -333,13 +333,40 @@ def fetch_all_yf_data(symbols: List[str]) -> pd.DataFrame:
             json.dump(list(cache.values()), f, indent=2)
 
     # Strict silent-429 detector (Option A)
-    def is_silent_429(data: Dict[str, Any]) -> bool:
+    def is_strict_silent_429(data: Dict[str, Any]) -> bool:
         return (
             data.get("Revenue_TTM") is None and
             data.get("EBIT_TTM") is None and
             data.get("NetIncome_TTM") is None and
             data.get("TotalAssets_Annual") is None
         )
+
+    # Soft silent-429 detector (S1: 5 or more missing metrics)
+    def is_soft_silent_429(data: Dict[str, Any]) -> bool:
+        missing = 0
+
+        if data.get("Price") is None:
+            missing += 1
+        if data.get("Revenue_TTM") is None:
+            missing += 1
+        if data.get("EBIT_TTM") is None:
+            missing += 1
+        if data.get("EBITDA_TTM") is None:
+            missing += 1
+        if data.get("NetIncome_TTM") is None:
+            missing += 1
+        if data.get("FreeCashFlow_TTM") is None:
+            missing += 1
+        if data.get("TotalAssets_Annual") is None:
+            missing += 1
+
+        # These two are strong signals of throttling
+        if data.get("quarterly_financials_empty", False):
+            missing += 1
+        if data.get("quarterly_cashflow_empty", False):
+            missing += 1
+
+        return missing >= 5
 
     # Helper to handle 429
     def handle_429(current_batch_size: Optional[int] = None):
@@ -379,8 +406,17 @@ def fetch_all_yf_data(symbols: List[str]) -> pd.DataFrame:
             try:
                 data = fetch_yf_for_symbol(symbol)
 
+                # Add flags for empty DataFrames
+                data["quarterly_financials_empty"] = (
+                    data.get("Revenue_TTM") is None and
+                    data.get("EBIT_TTM") is None
+                )
+                data["quarterly_cashflow_empty"] = (
+                    data.get("FreeCashFlow_TTM") is None
+                )
+
                 # Silent 429 detection
-                if is_silent_429(data):
+                if is_strict_silent_429(data) or is_soft_silent_429(data):
                     print("  → Silent throttling detected.")
                     handle_429()
 
@@ -436,8 +472,17 @@ def fetch_all_yf_data(symbols: List[str]) -> pd.DataFrame:
             try:
                 data = fetch_yf_for_symbol(symbol)
 
+                # Add flags for empty DataFrames
+                data["quarterly_financials_empty"] = (
+                    data.get("Revenue_TTM") is None and
+                    data.get("EBIT_TTM") is None
+                )
+                data["quarterly_cashflow_empty"] = (
+                    data.get("FreeCashFlow_TTM") is None
+                )
+
                 # Silent 429 detection
-                if is_silent_429(data):
+                if is_strict_silent_429(data) or is_soft_silent_429(data):
                     print("  → Silent throttling detected.")
                     handle_429(current_batch_size=batch_size)
 
@@ -472,7 +517,8 @@ def fetch_all_yf_data(symbols: List[str]) -> pd.DataFrame:
     print("===================\n")
 
     return pd.DataFrame(list(cache.values()))
-    
+
+
 
 # -----------------------------
 # Main orchestration
