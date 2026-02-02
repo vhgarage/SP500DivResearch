@@ -273,11 +273,11 @@ def fetch_all_yf_data(symbols: List[str]) -> pd.DataFrame:
 
     Phase 1:
       - Free run (no batch limit), fetch symbol by symbol.
-      - On first 429 (explicit or silent): switch to batch mode, sleep, restart.
+      - On first 429 (explicit or silent or low-quality data): switch to batch mode, sleep, restart.
 
     Phase 2 (batch mode):
       - Start with batch size = 75.
-      - On 429 (explicit or silent): sleep, reduce batch size by 5 (min 5), restart.
+      - On 429 (explicit or silent or low-quality data): sleep, reduce batch size by 5 (min 5), restart.
       - Continue until all symbols are fetched.
 
     Includes:
@@ -285,6 +285,7 @@ def fetch_all_yf_data(symbols: List[str]) -> pd.DataFrame:
       - randomized pacing
       - cooldowns
       - strict + soft silent-429 detection
+      - data quality threshold detection
       - end-of-run summary
     """
 
@@ -332,7 +333,7 @@ def fetch_all_yf_data(symbols: List[str]) -> pd.DataFrame:
         with open(cache_path, "w") as f:
             json.dump(list(cache.values()), f, indent=2)
 
-    # Strict silent-429 detector (Option A)
+    # Strict silent-429 detector
     def is_strict_silent_429(data: Dict[str, Any]) -> bool:
         return (
             data.get("Revenue_TTM") is None and
@@ -341,7 +342,7 @@ def fetch_all_yf_data(symbols: List[str]) -> pd.DataFrame:
             data.get("TotalAssets_Annual") is None
         )
 
-    # Soft silent-429 detector (S1: 5 or more missing metrics)
+    # Soft silent-429 detector (5 or more missing)
     def is_soft_silent_429(data: Dict[str, Any]) -> bool:
         missing = 0
 
@@ -360,7 +361,6 @@ def fetch_all_yf_data(symbols: List[str]) -> pd.DataFrame:
         if data.get("TotalAssets_Annual") is None:
             missing += 1
 
-        # These two are strong signals of throttling
         if data.get("quarterly_financials_empty", False):
             missing += 1
         if data.get("quarterly_cashflow_empty", False):
@@ -368,13 +368,46 @@ def fetch_all_yf_data(symbols: List[str]) -> pd.DataFrame:
 
         return missing >= 5
 
-    # Helper to handle 429
+    # Data Quality Threshold (DQT): too few meaningful fields present
+    def is_low_quality(data: Dict[str, Any]) -> bool:
+        present = 0
+
+        if data.get("Price") not in (None, 0):
+            present += 1
+        if data.get("Revenue_TTM") is not None:
+            present += 1
+        if data.get("EBIT_TTM") is not None:
+            present += 1
+        if data.get("EBITDA_TTM") is not None:
+            present += 1
+        if data.get("NetIncome_TTM") is not None:
+            present += 1
+        if data.get("FreeCashFlow_TTM") is not None:
+            present += 1
+        if data.get("TotalAssets_Annual") is not None:
+            present += 1
+        if not data.get("quarterly_financials_empty", False):
+            present += 1
+        if not data.get("quarterly_cashflow_empty", False):
+            present += 1
+
+        # If fewer than 3 meaningful signals, treat as throttled/junk
+        return present < 3
+
+    # Unified throttling check
+    def is_throttled_data(data: Dict[str, Any]) -> bool:
+        return (
+            is_strict_silent_429(data) or
+            is_soft_silent_429(data) or
+            is_low_quality(data)
+        )
+
+    # Helper to handle 429 / throttling
     def handle_429(current_batch_size: Optional[int] = None):
         nonlocal mode
-        print("  → 429 detected (explicit or silent). Entering cooldown...")
+        print("  → Throttling detected (explicit or silent or low-quality). Entering cooldown...")
         time.sleep(600)  # 10 minutes
 
-        # Switch to batch mode if we were in free mode
         if mode == "free":
             mode = "batch"
             with open(mode_path, "w") as f:
@@ -384,7 +417,6 @@ def fetch_all_yf_data(symbols: List[str]) -> pd.DataFrame:
                 f.write(str(batch_size))
             print("  → Switching to BATCH mode with batch size 75.")
         else:
-            # Already in batch mode: reduce batch size
             if current_batch_size is None:
                 current_batch_size = 75
             new_batch_size = max(5, current_batch_size - 5)
@@ -406,7 +438,7 @@ def fetch_all_yf_data(symbols: List[str]) -> pd.DataFrame:
             try:
                 data = fetch_yf_for_symbol(symbol)
 
-                # Add flags for empty DataFrames
+                # Flags for emptiness (used by detectors)
                 data["quarterly_financials_empty"] = (
                     data.get("Revenue_TTM") is None and
                     data.get("EBIT_TTM") is None
@@ -415,9 +447,8 @@ def fetch_all_yf_data(symbols: List[str]) -> pd.DataFrame:
                     data.get("FreeCashFlow_TTM") is None
                 )
 
-                # Silent 429 detection
-                if is_strict_silent_429(data) or is_soft_silent_429(data):
-                    print("  → Silent throttling detected.")
+                if is_throttled_data(data):
+                    print("  → Throttling detected from data quality.")
                     handle_429()
 
                 cache[symbol] = data
@@ -433,9 +464,6 @@ def fetch_all_yf_data(symbols: List[str]) -> pd.DataFrame:
 
             time.sleep(random.uniform(0.8, 3.0))
 
-        # -----------------------------
-        # SUMMARY
-        # -----------------------------
         successes = sum(1 for v in cache.values() if "Error" not in v)
         failures = sum(1 for v in cache.values() if "Error" in v)
         print("\n===== SUMMARY =====")
@@ -472,7 +500,6 @@ def fetch_all_yf_data(symbols: List[str]) -> pd.DataFrame:
             try:
                 data = fetch_yf_for_symbol(symbol)
 
-                # Add flags for empty DataFrames
                 data["quarterly_financials_empty"] = (
                     data.get("Revenue_TTM") is None and
                     data.get("EBIT_TTM") is None
@@ -481,9 +508,8 @@ def fetch_all_yf_data(symbols: List[str]) -> pd.DataFrame:
                     data.get("FreeCashFlow_TTM") is None
                 )
 
-                # Silent 429 detection
-                if is_strict_silent_429(data) or is_soft_silent_429(data):
-                    print("  → Silent throttling detected.")
+                if is_throttled_data(data):
+                    print("  → Throttling detected from data quality.")
                     handle_429(current_batch_size=batch_size)
 
                 cache[symbol] = data
@@ -502,16 +528,13 @@ def fetch_all_yf_data(symbols: List[str]) -> pd.DataFrame:
         print("Batch complete. Cooling down for 3 minutes...")
         time.sleep(180)
 
-    # -----------------------------
-    # SUMMARY
-    # -----------------------------
     successes = sum(1 for v in cache.values() if "Error" not in v)
     failures = sum(1 for v in cache.values() if "Error" in v)
     print("\n===== SUMMARY =====")
     print(f"Mode: BATCH MODE")
     print(f"Batch size used: {batch_size}")
     print(f"Total symbols: {n}")
-    print(f"Fetched successfully: {successes}")
+        print(f"Fetched successfully: {successes}")
     print(f"Failed: {failures}")
     print(f"Remaining: {n - len(cache)}")
     print("===================\n")
